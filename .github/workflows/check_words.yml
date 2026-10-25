@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - hindwi-checker
+      - main
     paths-ignore:
       - 'hindwi_validation_results.csv'
       - 'Validated_word_list_with_hindwi.xlsx'
