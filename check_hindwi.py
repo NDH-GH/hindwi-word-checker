@@ -5,6 +5,7 @@ import urllib.parse
 import re
 import html
 import csv
+import argparse
 import openpyxl
 import requests
 
@@ -19,7 +20,7 @@ INPUT_EXCEL = "Validated word list.xlsx"
 PROGRESS_CSV = "hindwi_validation_results.csv"
 OUTPUT_EXCEL = "Validated_word_list_with_hindwi.xlsx"
 SHEET_NAME = "Validated_words"
-SAVE_INTERVAL = 25  # Save to disk every 25 words
+SAVE_INTERVAL = 10  # Save to disk every 10 words
 REQUEST_DELAY = 0.35  # Courtesy delay between requests (seconds)
 
 HEADERS = {
@@ -139,6 +140,10 @@ def query_hindwi(session, word, retries=3):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Hindwi Dictionary Word Checker")
+    parser.add_argument("--limit", type=int, default=0, help="Limit number of new words to process (0 = all)")
+    args = parser.parse_args()
+
     if not os.path.exists(INPUT_EXCEL):
         print(f"Error: Could not find '{INPUT_EXCEL}' in current directory.")
         sys.exit(1)
@@ -169,13 +174,19 @@ def main():
     session.headers.update(HEADERS)
 
     batch_to_save = []
-    processed_count = len(checkpoint)
+    new_processed_in_this_run = 0
+    total_processed = len(checkpoint)
     
-    print(f"Starting verification... ({processed_count}/{total} already done)")
+    limit_str = f" (limit: {args.limit})" if args.limit > 0 else ""
+    print(f"Starting verification... ({total_processed}/{total} already done){limit_str}")
 
     for idx, (row_num, word) in enumerate(words_to_process, start=1):
         if word in checkpoint:
             continue
+
+        if args.limit > 0 and new_processed_in_this_run >= args.limit:
+            print(f"[LIMIT REACHED] Processed {new_processed_in_this_run} words as requested.")
+            break
 
         result = query_hindwi(session, word)
         record = {
@@ -188,9 +199,10 @@ def main():
         }
         batch_to_save.append(record)
         checkpoint[word] = record
-        processed_count += 1
+        new_processed_in_this_run += 1
+        total_processed += 1
 
-        print(f"[{processed_count}/{total}] Row {row_num:5d}: {word:15s} -> {result['Hindwi_Status']:10s} (Card: {result['Card_Word'] or '-'})")
+        print(f"[{total_processed}/{total}] Row {row_num:5d}: {word:15s} -> {result['Hindwi_Status']:10s} (Card: {result['Card_Word'] or '-'})")
 
         if len(batch_to_save) >= SAVE_INTERVAL:
             append_results_to_csv(batch_to_save)
@@ -202,30 +214,32 @@ def main():
         append_results_to_csv(batch_to_save)
         batch_to_save.clear()
 
-    print("\nAll words processed! Creating final enriched Excel file...")
-    # Export full results back into an enriched Excel file
-    try:
-        wb_full = openpyxl.load_workbook(INPUT_EXCEL)
-        ws_full = wb_full[SHEET_NAME]
-        
-        # Add headers in columns D, E, F, G
-        ws_full.cell(row=1, column=4, value="Hindwi_Status")
-        ws_full.cell(row=1, column=5, value="Hindwi_Card_Word")
-        ws_full.cell(row=1, column=6, value="Hindwi_Meaning")
-        ws_full.cell(row=1, column=7, value="Hindwi_Meaning_URL")
-        
-        for r_idx, word in words_to_process:
-            data = checkpoint.get(word)
-            if data:
-                ws_full.cell(row=r_idx, column=4, value=data['Hindwi_Status'])
-                ws_full.cell(row=r_idx, column=5, value=data['Card_Word'])
-                ws_full.cell(row=r_idx, column=6, value=data['Meaning'])
-                ws_full.cell(row=r_idx, column=7, value=data['Meaning_URL'])
-                
-        wb_full.save(OUTPUT_EXCEL)
-        print(f"[SUCCESS] Final Excel saved to: '{OUTPUT_EXCEL}'")
-    except Exception as e:
-        print(f"Warning: Could not save final Excel: {e}. All data is safely saved in '{PROGRESS_CSV}'.")
+    print(f"\nSaved progress to '{PROGRESS_CSV}' ({total_processed}/{total} words completed).")
+
+    # If all done or requested, update enriched Excel
+    if total_processed >= total:
+        print("All words completed! Generating final enriched Excel file...")
+        try:
+            wb_full = openpyxl.load_workbook(INPUT_EXCEL)
+            ws_full = wb_full[SHEET_NAME]
+            
+            ws_full.cell(row=1, column=4, value="Hindwi_Status")
+            ws_full.cell(row=1, column=5, value="Hindwi_Card_Word")
+            ws_full.cell(row=1, column=6, value="Hindwi_Meaning")
+            ws_full.cell(row=1, column=7, value="Hindwi_Meaning_URL")
+            
+            for r_idx, word in words_to_process:
+                data = checkpoint.get(word)
+                if data:
+                    ws_full.cell(row=r_idx, column=4, value=data['Hindwi_Status'])
+                    ws_full.cell(row=r_idx, column=5, value=data['Card_Word'])
+                    ws_full.cell(row=r_idx, column=6, value=data['Meaning'])
+                    ws_full.cell(row=r_idx, column=7, value=data['Meaning_URL'])
+                    
+            wb_full.save(OUTPUT_EXCEL)
+            print(f"[SUCCESS] Final Excel saved to: '{OUTPUT_EXCEL}'")
+        except Exception as e:
+            print(f"Warning: Could not save final Excel: {e}")
 
 
 if __name__ == '__main__':
