@@ -20,7 +20,7 @@ INPUT_EXCEL = "Validated word list.xlsx"
 PROGRESS_CSV = "hindwi_validation_results.csv"
 OUTPUT_EXCEL = "Validated_word_list_with_hindwi.xlsx"
 SHEET_NAME = "Validated_words"
-SAVE_INTERVAL = 10  # Save to disk every 10 words
+SAVE_INTERVAL = 10  # Save to CSV every 10 words
 REQUEST_DELAY = 0.35  # Courtesy delay between requests (seconds)
 
 HEADERS = {
@@ -50,7 +50,7 @@ def load_checkpoint():
 def append_results_to_csv(new_rows):
     """Appends batch of results to the progress CSV."""
     file_exists = os.path.exists(PROGRESS_CSV) and os.path.getsize(PROGRESS_CSV) > 0
-    fieldnames = ['Index', 'Word', 'Hindwi_Status', 'Card_Word', 'Meaning', 'Meaning_URL']
+    fieldnames = ['Index', 'Word', 'Hindwi_Status', 'Column_D_Note', 'Card_Word', 'Meaning', 'Meaning_URL']
     with open(PROGRESS_CSV, 'a', encoding='utf-8', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
@@ -70,7 +70,7 @@ def query_hindwi(session, word, retries=3):
             if resp.status_code == 200:
                 resp_html = resp.text
                 
-                # Check for first card
+                # Target exclusively the first card
                 card_match = re.search(
                     r'<div class=["\']WordRelatedLists saveWord listingCardBg overflowAuto["\']>(.*?)</div>',
                     resp_html,
@@ -88,16 +88,25 @@ def query_hindwi(session, word, retries=3):
                         raw_meaning = li_match.group(2).strip()
                         meaning = html.unescape(re.sub(r'\s+', ' ', raw_meaning))
                         
-                        # Extract data-url
+                        # Extract link
                         url_match = re.search(r'data-url=["\']([^"\']*)["\']', card_html)
                         meaning_url = ""
                         if url_match:
                             slug = url_match.group(1).strip()
                             meaning_url = f"https://www.hindwidictionary.com{slug}" if slug.startswith('/') else slug
                         
-                        status = "OKAY" if word.strip() == card_word.strip() else "MISMATCH"
+                        is_match = (word.strip() == card_word.strip())
+                        status = "OKAY" if is_match else "MISMATCH"
+                        
+                        # Formulate Column D note
+                        if is_match:
+                            col_d_note = f"OKAY: {meaning}"
+                        else:
+                            col_d_note = f"Suggested: {card_word} | Meaning: {meaning}"
+                            
                         return {
                             'Hindwi_Status': status,
+                            'Column_D_Note': col_d_note,
                             'Card_Word': card_word,
                             'Meaning': meaning,
                             'Meaning_URL': meaning_url
@@ -105,6 +114,7 @@ def query_hindwi(session, word, retries=3):
                     else:
                         return {
                             'Hindwi_Status': 'PARSE_ERROR',
+                            'Column_D_Note': 'Could not parse first card',
                             'Card_Word': '',
                             'Meaning': '',
                             'Meaning_URL': ''
@@ -112,6 +122,7 @@ def query_hindwi(session, word, retries=3):
                 else:
                     return {
                         'Hindwi_Status': 'NOT_FOUND',
+                        'Column_D_Note': 'Not found in Hindwi Dictionary',
                         'Card_Word': '',
                         'Meaning': '',
                         'Meaning_URL': ''
@@ -125,6 +136,7 @@ def query_hindwi(session, word, retries=3):
             if attempt == retries:
                 return {
                     'Hindwi_Status': 'ERROR',
+                    'Column_D_Note': f"Error: {e}",
                     'Card_Word': '',
                     'Meaning': str(e),
                     'Meaning_URL': ''
@@ -133,10 +145,40 @@ def query_hindwi(session, word, retries=3):
             
     return {
         'Hindwi_Status': 'ERROR',
+        'Column_D_Note': 'Max retries exceeded',
         'Card_Word': '',
         'Meaning': 'Max retries exceeded',
         'Meaning_URL': ''
     }
+
+
+def export_excel(words_to_process, checkpoint):
+    """Generates the enriched Excel file with Column D populated."""
+    print("Generating enriched Excel file...")
+    try:
+        wb_full = openpyxl.load_workbook(INPUT_EXCEL)
+        ws_full = wb_full[SHEET_NAME]
+        
+        # Headers
+        ws_full.cell(row=1, column=4, value="Hindwi_Notes_and_Suggestions")
+        ws_full.cell(row=1, column=5, value="Hindwi_Status")
+        ws_full.cell(row=1, column=6, value="Suggested_First_Card_Word")
+        ws_full.cell(row=1, column=7, value="Meaning")
+        ws_full.cell(row=1, column=8, value="Meaning_URL")
+        
+        for r_idx, word in words_to_process:
+            data = checkpoint.get(word)
+            if data:
+                ws_full.cell(row=r_idx, column=4, value=data.get('Column_D_Note', ''))
+                ws_full.cell(row=r_idx, column=5, value=data.get('Hindwi_Status', ''))
+                ws_full.cell(row=r_idx, column=6, value=data.get('Card_Word', ''))
+                ws_full.cell(row=r_idx, column=7, value=data.get('Meaning', ''))
+                ws_full.cell(row=r_idx, column=8, value=data.get('Meaning_URL', ''))
+                
+        wb_full.save(OUTPUT_EXCEL)
+        print(f"[SUCCESS] Final Excel saved to: '{OUTPUT_EXCEL}'")
+    except Exception as e:
+        print(f"Warning: Could not save final Excel: {e}")
 
 
 def main():
@@ -193,6 +235,7 @@ def main():
             'Index': row_num,
             'Word': word,
             'Hindwi_Status': result['Hindwi_Status'],
+            'Column_D_Note': result['Column_D_Note'],
             'Card_Word': result['Card_Word'],
             'Meaning': result['Meaning'],
             'Meaning_URL': result['Meaning_URL']
@@ -202,7 +245,7 @@ def main():
         new_processed_in_this_run += 1
         total_processed += 1
 
-        print(f"[{total_processed}/{total}] Row {row_num:5d}: {word:15s} -> {result['Hindwi_Status']:10s} (Card: {result['Card_Word'] or '-'})")
+        print(f"[{total_processed}/{total}] Row {row_num:5d}: {word:15s} -> {result['Hindwi_Status']:10s} | Col D: {result['Column_D_Note'][:50]}")
 
         if len(batch_to_save) >= SAVE_INTERVAL:
             append_results_to_csv(batch_to_save)
@@ -216,30 +259,9 @@ def main():
 
     print(f"\nSaved progress to '{PROGRESS_CSV}' ({total_processed}/{total} words completed).")
 
-    # If all done or requested, update enriched Excel
+    # If all words done, generate Excel
     if total_processed >= total:
-        print("All words completed! Generating final enriched Excel file...")
-        try:
-            wb_full = openpyxl.load_workbook(INPUT_EXCEL)
-            ws_full = wb_full[SHEET_NAME]
-            
-            ws_full.cell(row=1, column=4, value="Hindwi_Status")
-            ws_full.cell(row=1, column=5, value="Hindwi_Card_Word")
-            ws_full.cell(row=1, column=6, value="Hindwi_Meaning")
-            ws_full.cell(row=1, column=7, value="Hindwi_Meaning_URL")
-            
-            for r_idx, word in words_to_process:
-                data = checkpoint.get(word)
-                if data:
-                    ws_full.cell(row=r_idx, column=4, value=data['Hindwi_Status'])
-                    ws_full.cell(row=r_idx, column=5, value=data['Card_Word'])
-                    ws_full.cell(row=r_idx, column=6, value=data['Meaning'])
-                    ws_full.cell(row=r_idx, column=7, value=data['Meaning_URL'])
-                    
-            wb_full.save(OUTPUT_EXCEL)
-            print(f"[SUCCESS] Final Excel saved to: '{OUTPUT_EXCEL}'")
-        except Exception as e:
-            print(f"Warning: Could not save final Excel: {e}")
+        export_excel(words_to_process, checkpoint)
 
 
 if __name__ == '__main__':
