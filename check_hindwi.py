@@ -6,6 +6,8 @@ import re
 import html
 import csv
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import openpyxl
 import requests
 
@@ -20,14 +22,16 @@ INPUT_EXCEL = "Validated word list.xlsx"
 PROGRESS_CSV = "hindwi_validation_results.csv"
 OUTPUT_EXCEL = "Validated_word_list_with_hindwi.xlsx"
 SHEET_NAME = "Validated_words"
-SAVE_INTERVAL = 10  # Save to CSV every 10 words
-REQUEST_DELAY = 0.35  # Courtesy delay between requests (seconds)
+SAVE_INTERVAL = 200  # Save Excel & CSV every 200 words
+NUM_WORKERS = 6      # 6 concurrent threads (~4-5 words per second)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
 }
+
+lock = threading.Lock()
 
 
 def load_checkpoint():
@@ -49,14 +53,15 @@ def load_checkpoint():
 
 def append_results_to_csv(new_rows):
     """Appends batch of results to the progress CSV."""
-    file_exists = os.path.exists(PROGRESS_CSV) and os.path.getsize(PROGRESS_CSV) > 0
-    fieldnames = ['Index', 'Word', 'Hindwi_Status', 'Column_D_Note', 'Card_Word', 'Meaning', 'Meaning_URL']
-    with open(PROGRESS_CSV, 'a', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        for r in new_rows:
-            writer.writerow(r)
+    with lock:
+        file_exists = os.path.exists(PROGRESS_CSV) and os.path.getsize(PROGRESS_CSV) > 0
+        fieldnames = ['Index', 'Word', 'Hindwi_Status', 'Column_D_Note', 'Card_Word', 'Meaning', 'Meaning_URL']
+        with open(PROGRESS_CSV, 'a', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            for r in new_rows:
+                writer.writerow(r)
 
 
 def query_hindwi(session, word, retries=3):
@@ -66,7 +71,7 @@ def query_hindwi(session, word, retries=3):
     
     for attempt in range(1, retries + 1):
         try:
-            resp = session.get(url, timeout=15)
+            resp = session.get(url, timeout=12)
             if resp.status_code == 200:
                 resp_html = resp.text
                 
@@ -128,8 +133,7 @@ def query_hindwi(session, word, retries=3):
                         'Meaning_URL': ''
                     }
             elif resp.status_code == 429:
-                print(f"    [429 Rate Limit] Backing off for {5 * attempt}s...")
-                time.sleep(5 * attempt)
+                time.sleep(3 * attempt)
             else:
                 time.sleep(1)
         except Exception as e:
@@ -141,7 +145,7 @@ def query_hindwi(session, word, retries=3):
                     'Meaning': str(e),
                     'Meaning_URL': ''
                 }
-            time.sleep(1.5)
+            time.sleep(1.0)
             
     return {
         'Hindwi_Status': 'ERROR',
@@ -154,36 +158,51 @@ def query_hindwi(session, word, retries=3):
 
 def export_excel(words_to_process, checkpoint):
     """Generates the enriched Excel file with Column D populated."""
-    print("Generating enriched Excel file...")
-    try:
-        wb_full = openpyxl.load_workbook(INPUT_EXCEL)
-        ws_full = wb_full[SHEET_NAME]
-        
-        # Headers
-        ws_full.cell(row=1, column=4, value="Hindwi_Notes_and_Suggestions")
-        ws_full.cell(row=1, column=5, value="Hindwi_Status")
-        ws_full.cell(row=1, column=6, value="Suggested_First_Card_Word")
-        ws_full.cell(row=1, column=7, value="Meaning")
-        ws_full.cell(row=1, column=8, value="Meaning_URL")
-        
-        for r_idx, word in words_to_process:
-            data = checkpoint.get(word)
-            if data:
-                ws_full.cell(row=r_idx, column=4, value=data.get('Column_D_Note', ''))
-                ws_full.cell(row=r_idx, column=5, value=data.get('Hindwi_Status', ''))
-                ws_full.cell(row=r_idx, column=6, value=data.get('Card_Word', ''))
-                ws_full.cell(row=r_idx, column=7, value=data.get('Meaning', ''))
-                ws_full.cell(row=r_idx, column=8, value=data.get('Meaning_URL', ''))
-                
-        wb_full.save(OUTPUT_EXCEL)
-        print(f"[SUCCESS] Final Excel saved to: '{OUTPUT_EXCEL}'")
-    except Exception as e:
-        print(f"Warning: Could not save final Excel: {e}")
+    with lock:
+        try:
+            wb_full = openpyxl.load_workbook(INPUT_EXCEL)
+            ws_full = wb_full[SHEET_NAME]
+            
+            # Headers
+            ws_full.cell(row=1, column=4, value="Hindwi_Notes_and_Suggestions")
+            ws_full.cell(row=1, column=5, value="Hindwi_Status")
+            ws_full.cell(row=1, column=6, value="Suggested_First_Card_Word")
+            ws_full.cell(row=1, column=7, value="Meaning")
+            ws_full.cell(row=1, column=8, value="Meaning_URL")
+            
+            for r_idx, word in words_to_process:
+                data = checkpoint.get(word)
+                if data:
+                    ws_full.cell(row=r_idx, column=4, value=data.get('Column_D_Note', ''))
+                    ws_full.cell(row=r_idx, column=5, value=data.get('Hindwi_Status', ''))
+                    ws_full.cell(row=r_idx, column=6, value=data.get('Card_Word', ''))
+                    ws_full.cell(row=r_idx, column=7, value=data.get('Meaning', ''))
+                    ws_full.cell(row=r_idx, column=8, value=data.get('Meaning_URL', ''))
+                    
+            wb_full.save(OUTPUT_EXCEL)
+            print(f"[AUTO-SAVE] Enriched Excel saved to: '{OUTPUT_EXCEL}'")
+        except Exception as e:
+            print(f"Warning: Could not save Excel: {e}")
+
+
+def worker_task(session, item):
+    row_num, word = item
+    result = query_hindwi(session, word)
+    return {
+        'Index': row_num,
+        'Word': word,
+        'Hindwi_Status': result['Hindwi_Status'],
+        'Column_D_Note': result['Column_D_Note'],
+        'Card_Word': result['Card_Word'],
+        'Meaning': result['Meaning'],
+        'Meaning_URL': result['Meaning_URL']
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Hindwi Dictionary Word Checker")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of new words to process (0 = all)")
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="Number of concurrent worker threads")
     args = parser.parse_args()
 
     if not os.path.exists(INPUT_EXCEL):
@@ -209,59 +228,74 @@ def main():
         words_to_process.append((r_idx, word))
 
     total = len(words_to_process)
-    print(f"Total words found in '{SHEET_NAME}': {total}")
-
     checkpoint = load_checkpoint()
-    session = requests.Session()
-    session.headers.update(HEADERS)
+
+    # Filter unvisited words
+    pending_items = [item for item in words_to_process if item[1] not in checkpoint]
+    if args.limit > 0:
+        pending_items = pending_items[:args.limit]
+
+    print(f"Total words: {total} | Already completed: {len(checkpoint)} | Remaining to check: {len(pending_items)}")
+
+    if not pending_items:
+        print("All words already processed!")
+        export_excel(words_to_process, checkpoint)
+        return
+
+    print(f"Launching {args.workers} concurrent workers...")
+
+    # Create thread-local session
+    thread_local = threading.local()
+
+    def get_session():
+        if not hasattr(thread_local, "session"):
+            s = requests.Session()
+            s.headers.update(HEADERS)
+            thread_local.session = s
+        return thread_local.session
+
+    def process_item(item):
+        session = get_session()
+        return worker_task(session, item)
 
     batch_to_save = []
-    new_processed_in_this_run = 0
-    total_processed = len(checkpoint)
-    
-    limit_str = f" (limit: {args.limit})" if args.limit > 0 else ""
-    print(f"Starting verification... ({total_processed}/{total} already done){limit_str}")
+    completed_in_run = 0
+    total_completed = len(checkpoint)
 
-    for idx, (row_num, word) in enumerate(words_to_process, start=1):
-        if word in checkpoint:
-            continue
+    t_start = time.time()
 
-        if args.limit > 0 and new_processed_in_this_run >= args.limit:
-            print(f"[LIMIT REACHED] Processed {new_processed_in_this_run} words as requested.")
-            break
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(process_item, item): item for item in pending_items}
+        
+        for future in as_completed(futures):
+            record = future.result()
+            word = record['Word']
+            checkpoint[word] = record
+            batch_to_save.append(record)
+            
+            completed_in_run += 1
+            total_completed += 1
+            
+            # Print brief progress every 10 words
+            if completed_in_run % 10 == 0 or completed_in_run == len(pending_items):
+                elapsed = time.time() - t_start
+                rate = completed_in_run / elapsed if elapsed > 0 else 0
+                remaining_sec = (len(pending_items) - completed_in_run) / rate if rate > 0 else 0
+                print(f"[{total_completed}/{total}] Checked: {word:12s} ({record['Hindwi_Status']:8s}) | Speed: {rate:.1f} w/s | Est. remaining: {remaining_sec/60:.1f} min")
 
-        result = query_hindwi(session, word)
-        record = {
-            'Index': row_num,
-            'Word': word,
-            'Hindwi_Status': result['Hindwi_Status'],
-            'Column_D_Note': result['Column_D_Note'],
-            'Card_Word': result['Card_Word'],
-            'Meaning': result['Meaning'],
-            'Meaning_URL': result['Meaning_URL']
-        }
-        batch_to_save.append(record)
-        checkpoint[word] = record
-        new_processed_in_this_run += 1
-        total_processed += 1
-
-        print(f"[{total_processed}/{total}] Row {row_num:5d}: {word:15s} -> {result['Hindwi_Status']:10s} | Col D: {result['Column_D_Note'][:50]}")
-
-        if len(batch_to_save) >= SAVE_INTERVAL:
-            append_results_to_csv(batch_to_save)
-            batch_to_save.clear()
-
-        time.sleep(REQUEST_DELAY)
+            # Periodic batch save
+            if len(batch_to_save) >= SAVE_INTERVAL:
+                append_results_to_csv(batch_to_save)
+                batch_to_save.clear()
+                export_excel(words_to_process, checkpoint)
 
     if batch_to_save:
         append_results_to_csv(batch_to_save)
         batch_to_save.clear()
 
-    print(f"\nSaved progress to '{PROGRESS_CSV}' ({total_processed}/{total} words completed).")
-
-    # If all words done, generate Excel
-    if total_processed >= total:
-        export_excel(words_to_process, checkpoint)
+    # Final full Excel export
+    export_excel(words_to_process, checkpoint)
+    print(f"\n[COMPLETE] Successfully verified all words! Final file: '{OUTPUT_EXCEL}'")
 
 
 if __name__ == '__main__':
